@@ -1,0 +1,167 @@
+
+This directory is intended for PlatformIO Test Runner and project tests.
+
+Unit Testing is a software testing method by which individual units of
+source code, sets of one or more MCU program modules together with associated
+control data, usage procedures, and operating procedures, are tested to
+determine whether they are fit for use. Unit testing finds problems early
+in the development cycle.
+
+More information about PlatformIO Unit Testing:
+- https://docs.platformio.org/en/latest/advanced/unit-testing/index.html
+
+# Smart CNC Station — Firmware (Milestone 1)
+
+Picks up from the team's design-decision chat + working-summary PDF.
+This milestone covers: dual-I2C sensors, MQTT publish, CN1 job-status
+derivation, and E-stop trigger logic (relay side). It does **not** yet
+cover Firebase, the calibration coupon, or Node-RED (Node-RED just needs
+to subscribe to the topics below — no firmware work required for that).
+
+## Before you flash this to real hardware
+
+Three things in `include/config.h` are placeholders, not real values.
+Do not skip these:
+
+1. **WiFi SSID/password + MQTT broker IP** — fill in once you know where
+   Mosquitto is running.
+2. **ES32C14 DI/DO GPIO numbers** (`DI_IN1_PIN` etc.) — currently `-1`,
+   which the code treats as "not configured" and runs in a safe no-op
+   mode (job state reports `unknown`, relay isn't driven). The real
+   mapping is in eletechsup's datasheet (`ES32C14-1.rar`) or has to be
+   found empirically — trigger each DI/relay channel one at a time and
+   watch Serial output, per the working summary's own recommendation.
+   **Do not wire real 24V CN1 signals in until this is confirmed.**
+3. **`VIBRATION_THRESHOLD_G`** — set to `-1.0` on purpose so it's obviously
+   fake. This is not a code decision, it's an experimental one: run the
+   CNC through a few normal jobs, log the RMS values this firmware is
+   already computing, and set the threshold with margin above your
+   observed noise floor.
+
+## Open design question not yet resolved
+
+The brief asks for BME280 temperature on **both** X and Y motors, but the
+working-summary PDF's I2C address map only lists **one** BME280 (0x76).
+The code defaults to one BME280 (`ENABLE_SECOND_BME280 = false`). If
+you're actually running two, wire the second to Bus A at 0x77 (solder the
+address jumper on that breakout) and flip that flag — otherwise, decide
+as a team whether one BME280 (ambient near both motors) is an acceptable
+substitution and say so explicitly in your report, since the brief is
+specific about X *and* Y.
+
+## MQTT topics — reused from your Task 3.1/3.3 project
+
+These follow the `<category>/<component>/<field>` convention documented
+in `Project_9_Documentation.pdf` (`sensor/bme280/temperature`,
+`motor/status/state`, `device/esp32/status`), rather than a newly
+invented structure. This satisfies the brief's "reuse the topic
+structure... from your earlier tasks" requirement — no disclosure needed
+in the report, since it genuinely is reused, not just similar.
+
+| Topic | Payload |
+|---|---|
+| `job/status/state` | `idle` \| `running` \| `paused` \| `faulted` \| `done` |
+| `sensor/bme280_x/temperature` | °C |
+| `sensor/bme280_y/temperature` | °C (only if 2nd BME280 enabled) |
+| `sensor/mpu6050/vibration` | g, RMS |
+| `sensor/driver/temperature` | °C, only published if driver exposes it |
+| `sensor/driver/fault` | `0`/`1` |
+| `estop/status/triggered` | `manual` \| `vibration` |
+| `job/status/start` | timestamp |
+| `job/status/end` | JSON: `{"outcome":..., "stop_reason":...}` |
+| `device/esp32/status` | **not yet published** — old project used a retained LWT here feeding a "Connection monitor" (LWT + 3s watchdog) function node so Node-RED could distinguish "online" from "stale." This firmware doesn't set an MQTT LWT yet; add it and reuse that same dual-signal pattern when building the Node-RED flow, rather than a weaker single-signal check. |
+
+## Design notes carried over from the PDF (already decided, not open)
+
+- **Job state logic**: `Out2 active -> faulted`, else `Status active ->
+  running`, else `Out1 active -> idle`; a running->idle transition with
+  no fault = `done`. `paused` isn't derivable from CN1 alone yet — needs
+  its own tracked state from a start/pause UI action.
+- **E-stop is a one-way signal** (ESP32 → relay → DrProc). The ESP32
+  does not read DrProc back, since it already knows its own state.
+- **E-stop never auto-resumes.** `resetEstopLatch()` exists but is never
+  called from the sensor loop — only wire it to a deliberate operator
+  action (button/dashboard command), per requirement 4.
+- **I2C split**: Bus A (GPIO21/4) = BME280 + both IMUs, safety-relevant.
+  Bus B (GPIO32/33) = OLED only, isolated so a display fault can't freeze
+  the vibration-sensing bus.
+
+## Still-open bench checks
+
+These aren't firmware problems — they're multimeter/bench checks the team
+still owes before final wiring:
+- ~~CN1 GND and CN2 GND same rail?~~ **DONE — confirmed connected
+  (continuity beep).**
+- ~~ES32C14 DI inputs: self-powered pull-up, or need external 24V?~~
+  **DONE — confirmed self-powered.** Bench reading was ~8.5V on an
+  unconnected DI pin (not 0V, not a clean rail voltage) — consistent
+  with this board's opto-isolated NPN inputs using a resistor-divider
+  network rather than a simple pull-up, which reads at a divider
+  midpoint under a high-impedance multimeter with nothing loading the
+  line. No external pull-up voltage needed; `DI_ACTIVE_LEVEL LOW` in
+  `config.h` is correct as-is.
+- ~~E-stop relay coil: DC or AC? Voltage?~~ **DONE — confirmed 24VDC.**
+  Transistor/MOSFET relay-driver approach from the working-summary PDF
+  is correct (an AC coil would have required an SSR instead). Matches
+  the system's 24V rail — order/confirm the 24V variant of the ES32C14
+  relay channel to match.
+- ~~ES32C14 relay variant ordered: 12V or 24V (must match system rail)~~
+  **DONE — confirmed 24V.** Board relay is labeled 24VDC coil / 250VAC
+  contact rating. Coil voltage matches the system's 24V rail and the
+  E-stop relay's 24VDC coil correctly; the 250VAC figure is just the
+  contact's switching capacity, not relevant here.
+- DrProc protection enabled in RD controller's Vendor parameters menu
+  (Menu → Vendor parameters → Machine config / protection enable —
+  confirmed in the manual that this must be explicitly turned on, the
+  mainboard ignores DrProc otherwise)
+
+## Next steps (not started)
+
+1. ~~Confirm stepper driver model~~ — **DONE**: confirmed 3DM580.
+   `readDriverTelemetry()` always returns `false` — this is a confirmed
+   hardware limitation (no temp/fault pin on this driver), not an
+   unfinished TODO. State this plainly in the report.
+2. Node-RED flow + dashboard consuming the topics above.
+3. Firebase schema + logging (job start/end/outcome/stop_reason, plus
+   calibration coupon results).
+4. Calibration coupon: design the test pattern, decide the varied
+   parameter and quality metric, before writing any generation/logging
+   code for it.
+
+## Resolved: pen mechanism vs. Core Requirement 1
+
+Z-axis was canceled and the pen is pinned/fixed in place (no lift
+mechanism). Team decision: **document the descope in the report** rather
+than add a lift mechanism — explicitly explain in the readiness
+checklist why "pen-up/pen-down operation" doesn't apply to this build
+and why that's an acceptable substitution. Nothing to change in
+firmware for this; it's a report-writing item for Core Requirement 1.
+
+## Confirmed against the official RDC6445G/S manual
+
+The team's working-summary PDF had several items marked Caution/
+Unverified, inferred from indirect evidence. Cross-checking against
+RD's official RDC6445G/S Control System manual resolves some of these:
+
+- **CN1 pinout** (GND/Out2-fault/Out1-idle/Status-running/Wind/+24V) —
+  confirmed exactly as planned. Job-state derivation logic in
+  `deriveJobState()` is correct as written.
+- **DrProc behavior** — previously inferred from the similar FootSW
+  pin's description; the official manual states it directly: when
+  enabled, a high level *or a floating/disconnected pin* triggers
+  protection. The fail-safe wiring (relay NC contact, floating on trip)
+  is confirmed correct, not just assumed.
+- **Common-anode requirement** between controller and driver — confirmed
+  in the manual's motor driver chapter, matches the 3DM580 wiring plan
+  from the pre-training research doc.
+- **CN3/CN4 limit-switch pinout** — confirmed as planned.
+
+Still open (the RD manual doesn't cover this — it's controller-side
+documentation only):
+- ~~Whether CN1 GND and CN2 GND are the same internal rail~~ —
+  **CONFIRMED by bench test (continuity beep): they are the same rail.**
+  Safe to treat CN1 GND and CN2 GND as one common ground when wiring
+  into the ES32C14 — you don't need to route them separately.
+- ES32C14 DI/DO-to-GPIO mapping — a separate third-party expansion
+  board, entirely outside this manual's scope. Still placeholders in
+  `config.h`.
