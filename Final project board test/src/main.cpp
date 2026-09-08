@@ -9,28 +9,12 @@
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_SH110X.h>
 
-// =====================================================
-// I2C — routed through ES32C14 "Free Port" pins only.
-// IMPORTANT: SCL moved from the ESP32 default (GPIO22)
-// to GPIO33, because GPIO22 is hard-wired to the
-// ES32C14's RS485 port (IO1/IO3/IO22) and is NOT free.
-// GPIO21 (SDA) IS on the Free Port list, so it's kept.
-// =====================================================
-
-#define SDA_PIN 21   // ES32C14 Free Port
-#define SCL_PIN 16   // ES32C14 Free Port (was 22 - conflicted with RS485)
+#define SDA_PIN 21   
+#define SCL_PIN 16   
 
 #define BME_ADDRESS  0x76
 #define MPU_ADDRESS  0x68
 #define OLED_ADDRESS 0x3C
-
-// =====================================================
-// OLED TYPE
-// =====================================================
-
-// 1 = SSD1306 128x64
-// 2 = SSD1306 128x32
-// 3 = SH1106 128x64
 
 #define OLED_MODE 1
 
@@ -55,10 +39,7 @@ Adafruit_SH1106G sh1106(
     -1
 );
 
-// =====================================================
 // SENSORS
-// =====================================================
-
 Adafruit_BME280 bme;
 Adafruit_MPU6050 mpu;
 
@@ -66,13 +47,7 @@ bool bmeOK = false;
 bool mpuOK = false;
 bool oledOK = false;
 
-// =====================================================
 // VIBRATION SETTINGS
-// =====================================================
-
-// Each displayed vibration reading is calculated
-// from 100 accelerometer samples.
-
 const int SAMPLE_COUNT = 100;
 
 // 10 ms = about 100 Hz sampling
@@ -81,10 +56,7 @@ const int SAMPLE_DELAY_MS = 10;
 // Reading counter
 unsigned long readingNumber = 0;
 
-// =====================================================
 // OLED INITIALIZATION
-// =====================================================
-
 bool initOLED() {
 
 #if OLED_MODE == 1
@@ -111,10 +83,7 @@ bool initOLED() {
 #endif
 }
 
-// =====================================================
 // I2C SCANNER
-// =====================================================
-
 void scanI2C() {
 
     Serial.println();
@@ -144,10 +113,7 @@ void scanI2C() {
     Serial.println("=======================");
 }
 
-// =====================================================
 // VIBRATION RMS
-// =====================================================
-
 float readVibrationRMS() {
 
     if (!mpuOK)
@@ -161,10 +127,7 @@ float readVibrationRMS() {
     float sumY = 0.0;
     float sumZ = 0.0;
 
-    // -----------------------------------------
     // Collect accelerometer samples
-    // -----------------------------------------
-
     for (int i = 0;
          i < SAMPLE_COUNT;
          i++) {
@@ -190,18 +153,12 @@ float readVibrationRMS() {
         delay(SAMPLE_DELAY_MS);
     }
 
-    // -----------------------------------------
     // Calculate average acceleration
-    // -----------------------------------------
-
     float meanX = sumX / SAMPLE_COUNT;
     float meanY = sumY / SAMPLE_COUNT;
     float meanZ = sumZ / SAMPLE_COUNT;
 
-    // -----------------------------------------
     // Calculate vibration around the average
-    // -----------------------------------------
-
     float sumSquares = 0.0;
 
     for (int i = 0;
@@ -223,10 +180,7 @@ float readVibrationRMS() {
     return vibrationG;
 }
 
-// =====================================================
 // READ CURRENT ACCELERATION
-// =====================================================
-
 void readAcceleration(float &x, float &y, float &z) {
 
     x = 0;
@@ -247,10 +201,7 @@ void readAcceleration(float &x, float &y, float &z) {
     z = accel.acceleration.z;
 }
 
-// =====================================================
 // OLED DISPLAY
-// =====================================================
-
 void updateOLED(float temperature, float vibration) {
 
     if (!oledOK)
@@ -333,10 +284,7 @@ void updateOLED(float temperature, float vibration) {
 #endif
 }
 
-// =====================================================
 // SETUP
-// =====================================================
-
 void setup() {
 
     Serial.begin(115200);
@@ -352,19 +300,13 @@ void setup() {
 
     scanI2C();
 
-    // -----------------------------------------
     // BME280
-    // -----------------------------------------
-
     bmeOK = bme.begin(BME_ADDRESS);
 
     Serial.print("BME280: ");
     Serial.println(bmeOK ? "OK" : "ERROR");
 
-    // -----------------------------------------
     // MPU6050
-    // -----------------------------------------
-
     mpuOK = mpu.begin(MPU_ADDRESS);
 
     Serial.print("MPU6050: ");
@@ -382,10 +324,7 @@ void setup() {
         Serial.println("ERROR");
     }
 
-    // -----------------------------------------
     // OLED
-    // -----------------------------------------
-
     oledOK = initOLED();
 
     Serial.print("OLED: ");
@@ -396,41 +335,26 @@ void setup() {
     Serial.println();
 }
 
-// =====================================================
 // LOOP
-// =====================================================
-
 void loop() {
 
     readingNumber++;
 
-    // =========================================
     // Temperature
-    // =========================================
-
     float temperature = NAN;
 
     if (bmeOK) {
         temperature = bme.readTemperature();
     }
 
-    // =========================================
     // Current acceleration
-    // =========================================
-
     float ax, ay, az;
     readAcceleration(ax, ay, az);
 
-    // =========================================
     // Vibration
-    // =========================================
-
     float vibration = readVibrationRMS();
 
-    // =========================================
     // SERIAL OUTPUT
-    // =========================================
-
     Serial.println();
     Serial.println("--------------------------------");
 
@@ -468,10 +392,7 @@ void loop() {
 
     Serial.println("--------------------------------");
 
-    // =========================================
     // OLED
-    // =========================================
-
     updateOLED(temperature, vibration);
 
     delay(500);
