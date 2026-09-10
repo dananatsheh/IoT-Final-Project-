@@ -7,8 +7,9 @@
 #include <U8g2lib.h>
 
 /* ======================================================
-   WIFI
+   WIFI CONFIGURATION
    ====================================================== */
+
 #define WIFI_SSID "CYBER_EXT"
 #define WIFI_PASSWORD "cyberap2025"
 
@@ -29,7 +30,7 @@
    MQTT TOPICS
    ====================================================== */
 
-// ESP32 -> MQTT
+// ESP32 -> Node-RED
 #define TOPIC_STATE         "job/status/state"
 #define TOPIC_JOB_START     "job/status/start"
 #define TOPIC_JOB_END       "job/status/end"
@@ -39,24 +40,25 @@
 #define TOPIC_TEMP_X        "sensor/bme280_x/temperature"
 #define TOPIC_TEMP_Y        "sensor/bme280_y/temperature"
 
-// MQTT -> ESP32
-#define TOPIC_VIBRATION     "sensor/mpu6050/vibration"
+#define TOPIC_ESTOP_EVENT   "estop/status/triggered"
+
+// Node-RED -> ESP32
 #define TOPIC_ESTOP_COMMAND "estop/command"
 
 /* ======================================================
    BME280 PINS
    ====================================================== */
 
-// BME X
+// BME280 X
 #define SDA_BUS1 21
 #define SCL_BUS1 23
 
-// BME Y
+// BME280 Y
 #define SDA_BUS2 32
 #define SCL_BUS2 33
 
 /* ======================================================
-   OLED
+   OLED PINS
    ====================================================== */
 
 #define OLED_SDA 4
@@ -64,6 +66,7 @@
 
 /* ======================================================
    RDC6445S INPUTS
+   ES32C14
    ====================================================== */
 
 #define RDC_OUT1_PIN 19
@@ -71,17 +74,20 @@
 
 /* ======================================================
    RELAY
-   ES32C14 Relay 1
+   ES32C14 Relay 1 = GPIO27
    ====================================================== */
 
-#define RELAY_PIN 12
+#define RELAY_PIN 27
 
 #define RELAY_ACTIVE_LEVEL HIGH
 #define RELAY_INACTIVE_LEVEL LOW
 
 /* ======================================================
-   I2C
+   I2C ADDRESSES
    ====================================================== */
+
+// Both sensors can use 0x76 because
+// they are on different I2C buses.
 
 #define BME_X_ADDRESS 0x76
 #define BME_Y_ADDRESS 0x76
@@ -94,23 +100,20 @@
    TEMPERATURE SAFETY
    ====================================================== */
 
+// Trip relay at 50 C
 #define TEMP_HIGH_THRESHOLD_C 50.0f
+
+// Release thermal trip below 48 C
 #define TEMP_RESET_THRESHOLD_C 48.0f
-
-/* ======================================================
-   VIBRATION SAFETY
-   ====================================================== */
-
-#define VIBRATION_THRESHOLD_G 1.0f
 
 /* ======================================================
    TIMING
    ====================================================== */
 
 #define SENSOR_INTERVAL_MS 1000
-#define MQTT_PUBLISH_INTERVAL_MS 1000
 #define OLED_INTERVAL_MS 250
 #define SERIAL_INTERVAL_MS 1000
+#define MQTT_PUBLISH_INTERVAL_MS 1000
 
 #define WIFI_RECONNECT_INTERVAL_MS 10000
 #define MQTT_RECONNECT_INTERVAL_MS 3000
@@ -125,7 +128,7 @@ TwoWire BME_X_BUS = TwoWire(0);
 TwoWire BME_Y_BUS = TwoWire(1);
 
 /* ======================================================
-   BME280
+   BME280 OBJECTS
    ====================================================== */
 
 Adafruit_BME280 bmeX;
@@ -139,6 +142,7 @@ float tempY = NAN;
 
 /* ======================================================
    OLED
+   Software I2C
    ====================================================== */
 
 U8G2_SSD1306_128X64_NONAME_F_SW_I2C oled(
@@ -151,29 +155,13 @@ U8G2_SSD1306_128X64_NONAME_F_SW_I2C oled(
 bool oledOK = false;
 
 /* ======================================================
-   SAFETY STATES
+   RELAY / SAFETY STATE
    ====================================================== */
 
 bool relayActive = false;
 
 bool thermalTripActive = false;
-
-/*
-   Vibration fault is LATCHED.
-
-   Once vibration > 1.0 g,
-   restart/reset ESP32 to clear it.
-*/
-bool vibrationTripActive = false;
-
-/*
-   Dashboard MQTT emergency stop.
-
-   Can be cleared with RESET/OFF/FALSE/0.
-*/
-bool mqttEstopActive = false;
-
-float vibrationRMS = 0.0f;
+bool manualStopActive = false;
 
 /* ======================================================
    CNC STATE
@@ -195,7 +183,7 @@ bool wasRunning = false;
 unsigned long doneStartTime = 0;
 
 /* ======================================================
-   NETWORK
+   WIFI / MQTT
    ====================================================== */
 
 WiFiClient wifiClient;
@@ -206,9 +194,9 @@ PubSubClient mqttClient(wifiClient);
    ====================================================== */
 
 unsigned long lastSensorRead = 0;
-unsigned long lastMQTTPublish = 0;
 unsigned long lastOLEDUpdate = 0;
 unsigned long lastSerialPrint = 0;
+unsigned long lastMQTTPublish = 0;
 
 unsigned long lastWiFiAttempt = 0;
 unsigned long lastMQTTAttempt = 0;
@@ -225,13 +213,13 @@ void applyRelayState();
 void readTemperatures();
 void checkTemperatureSafety();
 
-void triggerVibrationTrip(float value);
-
-void triggerMQTTEstop();
-void resetMQTTEstop();
-
 void updateCNCState();
 void handleStateChange();
+
+void updateOLED();
+void printStatus();
+
+void handleSerialCommands();
 
 void connectWiFi();
 void connectMQTT();
@@ -250,11 +238,11 @@ void publishJobEnd(
     const char *reason
 );
 
-void updateOLED();
-void printStatus();
+void triggerManualStop();
+void resetManualStop();
 
 /* ======================================================
-   CNC STATE NAME
+   CNC STATE -> TEXT
    ====================================================== */
 
 const char *stateToString(CNCState state)
@@ -295,35 +283,38 @@ void setRelay(bool active)
 }
 
 /* ======================================================
-   FINAL RELAY LOGIC
+   APPLY SAFETY RELAY STATE
    ====================================================== */
 
 void applyRelayState()
 {
     /*
-       Relay energizes if ANY condition is true:
+       Relay energizes if:
 
        1. Temperature >= 50 C
-       2. Vibration > 1.0 g
-       3. Dashboard MQTT E-stop
+       OR
+       2. Manual E-stop requested
     */
 
-    bool shouldEnergize =
+    bool shouldActivate =
         thermalTripActive ||
-        vibrationTripActive ||
-        mqttEstopActive;
+        manualStopActive;
 
     setRelay(
-        shouldEnergize
+        shouldActivate
     );
 }
 
 /* ======================================================
-   BME280 READ
+   READ TEMPERATURES
    ====================================================== */
 
 void readTemperatures()
 {
+    /* --------------------------
+       X MOTOR SENSOR
+       -------------------------- */
+
     if (bmeXOK)
     {
         tempX =
@@ -334,6 +325,10 @@ void readTemperatures()
             tempX = NAN;
         }
     }
+
+    /* --------------------------
+       Y MOTOR SENSOR
+       -------------------------- */
 
     if (bmeYOK)
     {
@@ -348,7 +343,7 @@ void readTemperatures()
 }
 
 /* ======================================================
-   TEMPERATURE PROTECTION
+   TEMPERATURE SAFETY
    ====================================================== */
 
 void checkTemperatureSafety()
@@ -362,7 +357,7 @@ void checkTemperatureSafety()
         tempY >= TEMP_HIGH_THRESHOLD_C;
 
     /* ==================================================
-       TRIGGER TEMPERATURE STOP
+       NEW THERMAL TRIP
        ================================================== */
 
     if (
@@ -370,12 +365,7 @@ void checkTemperatureSafety()
         (xHigh || yHigh)
     )
     {
-        bool jobWasRunning =
-            currentState == CNC_RUNNING;
-
         thermalTripActive = true;
-
-        wasRunning = false;
 
         applyRelayState();
 
@@ -385,13 +375,13 @@ void checkTemperatureSafety()
         );
 
         Serial.println(
-            "HIGH TEMPERATURE"
+            "HIGH TEMPERATURE DETECTED"
         );
 
         if (xHigh)
         {
             Serial.print(
-                "Temperature X = "
+                "X Temperature: "
             );
 
             Serial.print(
@@ -407,7 +397,7 @@ void checkTemperatureSafety()
         if (yHigh)
         {
             Serial.print(
-                "Temperature Y = "
+                "Y Temperature: "
             );
 
             Serial.print(
@@ -428,35 +418,76 @@ void checkTemperatureSafety()
             "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
         );
 
-        if (
-            mqttClient.connected() &&
-            jobWasRunning
-        )
+        /* ----------------------------------------------
+           MQTT EVENT
+           ---------------------------------------------- */
+
+        if (mqttClient.connected())
         {
             if (xHigh && yHigh)
             {
-                publishJobEnd(
-                    "stopped",
+                mqttClient.publish(
+                    TOPIC_ESTOP_EVENT,
                     "high_temperature_x_y"
                 );
+
+                if (
+                    currentState ==
+                    CNC_RUNNING
+                )
+                {
+                    publishJobEnd(
+                        "stopped",
+                        "high_temperature_x_y"
+                    );
+                }
             }
 
             else if (xHigh)
             {
-                publishJobEnd(
-                    "stopped",
+                mqttClient.publish(
+                    TOPIC_ESTOP_EVENT,
                     "high_temperature_x"
                 );
+
+                if (
+                    currentState ==
+                    CNC_RUNNING
+                )
+                {
+                    publishJobEnd(
+                        "stopped",
+                        "high_temperature_x"
+                    );
+                }
             }
 
             else
             {
-                publishJobEnd(
-                    "stopped",
+                mqttClient.publish(
+                    TOPIC_ESTOP_EVENT,
                     "high_temperature_y"
                 );
+
+                if (
+                    currentState ==
+                    CNC_RUNNING
+                )
+                {
+                    publishJobEnd(
+                        "stopped",
+                        "high_temperature_y"
+                    );
+                }
             }
         }
+
+        /*
+           Do not allow this trip to later
+           become a normal DONE event.
+        */
+
+        wasRunning = false;
     }
 
     /* ==================================================
@@ -484,199 +515,18 @@ void checkTemperatureSafety()
 
             Serial.println();
             Serial.println(
-                "TEMPERATURE TRIP CLEARED"
+                "TEMPERATURE RETURNED TO SAFE LEVEL"
             );
 
-            if (relayActive)
-            {
-                Serial.println(
-                    "Relay remains energized because another fault is active."
-                );
-            }
+            Serial.println(
+                "THERMAL TRIP CLEARED"
+            );
         }
     }
 }
 
 /* ======================================================
-   VIBRATION TRIP
-   ====================================================== */
-
-void triggerVibrationTrip(float value)
-{
-    if (vibrationTripActive)
-    {
-        return;
-    }
-
-    bool jobWasRunning =
-        currentState == CNC_RUNNING;
-
-    vibrationTripActive = true;
-
-    wasRunning = false;
-
-    applyRelayState();
-
-    Serial.println();
-    Serial.println(
-        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    );
-
-    Serial.println(
-        "ABNORMAL VIBRATION"
-    );
-
-    Serial.print(
-        "Received vibration = "
-    );
-
-    Serial.print(
-        value,
-        3
-    );
-
-    Serial.println(
-        " g"
-    );
-
-    Serial.print(
-        "Threshold = "
-    );
-
-    Serial.print(
-        VIBRATION_THRESHOLD_G,
-        2
-    );
-
-    Serial.println(
-        " g"
-    );
-
-    Serial.println(
-        "RELAY ENERGIZED"
-    );
-
-    Serial.println(
-        "VIBRATION TRIP LATCHED"
-    );
-
-    Serial.println(
-        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    );
-
-    if (
-        mqttClient.connected() &&
-        jobWasRunning
-    )
-    {
-        publishJobEnd(
-            "stopped",
-            "high_vibration"
-        );
-    }
-}
-
-/* ======================================================
-   MQTT DASHBOARD EMERGENCY STOP
-   ====================================================== */
-
-void triggerMQTTEstop()
-{
-    if (mqttEstopActive)
-    {
-        return;
-    }
-
-    bool jobWasRunning =
-        currentState == CNC_RUNNING;
-
-    mqttEstopActive = true;
-
-    wasRunning = false;
-
-    applyRelayState();
-
-    Serial.println();
-    Serial.println(
-        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    );
-
-    Serial.println(
-        "DASHBOARD EMERGENCY STOP"
-    );
-
-    Serial.println(
-        "GPIO27 = HIGH"
-    );
-
-    Serial.println(
-        "RELAY ENERGIZED"
-    );
-
-    Serial.println(
-        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    );
-
-    if (
-        mqttClient.connected() &&
-        jobWasRunning
-    )
-    {
-        publishJobEnd(
-            "stopped",
-            "mqtt_estop"
-        );
-    }
-}
-
-/* ======================================================
-   MQTT DASHBOARD RESET
-   ====================================================== */
-
-void resetMQTTEstop()
-{
-    mqttEstopActive = false;
-
-    applyRelayState();
-
-    Serial.println();
-    Serial.println(
-        "DASHBOARD E-STOP RESET"
-    );
-
-    /*
-       Only release the relay if there are
-       no other safety faults.
-    */
-
-    if (vibrationTripActive)
-    {
-        Serial.println(
-            "RELAY STAYS ON: VIBRATION TRIP ACTIVE"
-        );
-    }
-
-    else if (thermalTripActive)
-    {
-        Serial.println(
-            "RELAY STAYS ON: TEMPERATURE TRIP ACTIVE"
-        );
-    }
-
-    else
-    {
-        Serial.println(
-            "GPIO27 = LOW"
-        );
-
-        Serial.println(
-            "RELAY DE-ENERGIZED"
-        );
-    }
-}
-
-/* ======================================================
-   RDC6445S STATE
+   RDC6445S CNC STATE
    ====================================================== */
 
 void updateCNCState()
@@ -693,12 +543,12 @@ void updateCNCState()
 
     /*
        OUT1:
-       LOW  = IDLE
-       HIGH = RUNNING
+       LOW  = Idle
+       HIGH = Running / Active
 
        OUT2:
-       LOW  = RDC FAULT
-       HIGH = NO FAULT
+       LOW  = RDC Fault
+       HIGH = No Fault
     */
 
     bool idleSignal =
@@ -708,13 +558,12 @@ void updateCNCState()
         (out2 == LOW);
 
     /* ==================================================
-       SAFETY FAULT
+       LOCAL SAFETY TRIP
        ================================================== */
 
     if (
         thermalTripActive ||
-        vibrationTripActive ||
-        mqttEstopActive
+        manualStopActive
     )
     {
         currentState =
@@ -803,7 +652,7 @@ void updateCNCState()
 }
 
 /* ======================================================
-   CNC STATE CHANGE
+   HANDLE CNC STATE CHANGE
    ====================================================== */
 
 void handleStateChange()
@@ -817,7 +666,6 @@ void handleStateChange()
     }
 
     Serial.println();
-
     Serial.println(
         "=============================="
     );
@@ -836,6 +684,10 @@ void handleStateChange()
         "=============================="
     );
 
+    /* ==================================================
+       MQTT STATE
+       ================================================== */
+
     if (mqttClient.connected())
     {
         mqttClient.publish(
@@ -846,9 +698,9 @@ void handleStateChange()
             true
         );
 
-        /* ==================================================
+        /* ----------------------------------------------
            JOB START
-           ================================================== */
+           ---------------------------------------------- */
 
         if (
             currentState ==
@@ -861,9 +713,9 @@ void handleStateChange()
             );
         }
 
-        /* ==================================================
+        /* ----------------------------------------------
            NORMAL JOB END
-           ================================================== */
+           ---------------------------------------------- */
 
         else if (
             currentState ==
@@ -876,16 +728,15 @@ void handleStateChange()
             );
         }
 
-        /* ==================================================
+        /* ----------------------------------------------
            RDC FAULT
-           ================================================== */
+           ---------------------------------------------- */
 
         else if (
             currentState ==
                 CNC_FAULT &&
             !thermalTripActive &&
-            !vibrationTripActive &&
-            !mqttEstopActive
+            !manualStopActive
         )
         {
             publishJobEnd(
@@ -897,6 +748,99 @@ void handleStateChange()
 
     previousState =
         currentState;
+}
+
+/* ======================================================
+   MANUAL E-STOP
+   ====================================================== */
+
+void triggerManualStop()
+{
+    if (manualStopActive)
+    {
+        return;
+    }
+
+    manualStopActive =
+        true;
+
+    /*
+       Check whether job was running
+       BEFORE state changes to FAULT.
+    */
+
+    bool jobWasRunning =
+        (
+            currentState ==
+            CNC_RUNNING
+        );
+
+    wasRunning =
+        false;
+
+    applyRelayState();
+
+    Serial.println();
+    Serial.println(
+        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    );
+
+    Serial.println(
+        "MANUAL E-STOP TRIGGERED"
+    );
+
+    Serial.println(
+        "RELAY ENERGIZED"
+    );
+
+    Serial.println(
+        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    );
+
+    if (mqttClient.connected())
+    {
+        mqttClient.publish(
+            TOPIC_ESTOP_EVENT,
+            "manual"
+        );
+
+        if (jobWasRunning)
+        {
+            publishJobEnd(
+                "stopped",
+                "manual_estop"
+            );
+        }
+    }
+}
+
+/* ======================================================
+   MANUAL E-STOP RESET
+   ====================================================== */
+
+void resetManualStop()
+{
+    if (thermalTripActive)
+    {
+        Serial.println(
+            "RESET BLOCKED:"
+        );
+
+        Serial.println(
+            "TEMPERATURE TRIP IS ACTIVE"
+        );
+
+        return;
+    }
+
+    manualStopActive =
+        false;
+
+    applyRelayState();
+
+    Serial.println(
+        "MANUAL E-STOP RESET"
+    );
 }
 
 /* ======================================================
@@ -936,36 +880,22 @@ void publishJobEnd(
 void mqttCallback(
     char *topic,
     byte *payload,
-    unsigned int  length
+    unsigned int length
 )
 {
-    char message[128];
+    String message;
 
-    unsigned int copyLength =
-        length;
-
-    if (
-        copyLength >=
-        sizeof(message)
+    for (
+        unsigned int i = 0;
+        i < length;
+        i++
     )
     {
-        copyLength =
-            sizeof(message) - 1;
+        message +=
+            (char)payload[i];
     }
 
-    memcpy(
-        message,
-        payload,
-        copyLength
-    );
-
-    message[copyLength] =
-        '\0';
-
-    String command =
-        String(message);
-
-    command.trim();
+    message.trim();
 
     Serial.println();
 
@@ -978,165 +908,63 @@ void mqttCallback(
     );
 
     Serial.print(
-        "] = "
+        "] "
     );
 
     Serial.println(
-        command
+        message
     );
 
     /* ==================================================
-       VIBRATION MQTT
+       NODE-RED E-STOP COMMAND
        ================================================== */
 
     if (
-        strcmp(
-            topic,
-            TOPIC_VIBRATION
-        ) == 0
+        String(topic) ==
+        TOPIC_ESTOP_COMMAND
     )
     {
-        char *endPointer;
-
-        float receivedValue =
-            strtof(
-                message,
-                &endPointer
-            );
-
-        if (
-            endPointer ==
-            message
-        )
-        {
-            Serial.println(
-                "INVALID VIBRATION PAYLOAD"
-            );
-
-            return;
-        }
-
-        vibrationRMS =
-            receivedValue;
-
-        Serial.print(
-            "Vibration = "
-        );
-
-        Serial.print(
-            vibrationRMS,
-            3
-        );
-
-        Serial.print(
-            " g | Threshold = "
-        );
-
-        Serial.print(
-            VIBRATION_THRESHOLD_G,
-            2
-        );
-
-        Serial.println(
-            " g"
-        );
-
-        /*
-           Trip ONLY if greater than 1.0 g.
-        */
-
-        if (
-            vibrationRMS >
-            VIBRATION_THRESHOLD_G
-        )
-        {
-            triggerVibrationTrip(
-                vibrationRMS
-            );
-        }
-
-        return;
-    }
-
-    /* ==================================================
-       DASHBOARD E-STOP COMMAND
-       ================================================== */
-
-    if (
-        strcmp(
-            topic,
-            TOPIC_ESTOP_COMMAND
-        ) == 0
-    )
-    {
-        /*
-           Supports common Node-RED button payloads.
-
-           STOP:
-           STOP
-           ON
-           TRUE
+        /* ----------------------------------------------
            TRIGGER
-           ESTOP
-           EMERGENCY
-           1
+           ---------------------------------------------- */
 
-           RESET:
+        if (
+            message.equalsIgnoreCase(
+                "STOP"
+            ) ||
+            message.equalsIgnoreCase(
+                "ON"
+            ) ||
+            message.equalsIgnoreCase(
+                "TRIGGER"
+            ) ||
+            message == "1"
+        )
+        {
+            triggerManualStop();
+        }
+
+        /* ----------------------------------------------
            RESET
-           OFF
-           FALSE
-           RELEASE
-           0
-        */
+           ---------------------------------------------- */
 
-        if (
-            command.equalsIgnoreCase("STOP") ||
-            command.equalsIgnoreCase("ON") ||
-            command.equalsIgnoreCase("TRUE") ||
-            command.equalsIgnoreCase("TRIGGER") ||
-            command.equalsIgnoreCase("ESTOP") ||
-            command.equalsIgnoreCase("EMERGENCY") ||
-            command == "1"
+        else if (
+            message.equalsIgnoreCase(
+                "RESET"
+            ) ||
+            message.equalsIgnoreCase(
+                "OFF"
+            ) ||
+            message == "0"
         )
         {
-            Serial.println(
-                "VALID DASHBOARD STOP COMMAND"
-            );
-
-            triggerMQTTEstop();
-
-            return;
+            resetManualStop();
         }
-
-        if (
-            command.equalsIgnoreCase("RESET") ||
-            command.equalsIgnoreCase("OFF") ||
-            command.equalsIgnoreCase("FALSE") ||
-            command.equalsIgnoreCase("RELEASE") ||
-            command == "0"
-        )
-        {
-            Serial.println(
-                "VALID DASHBOARD RESET COMMAND"
-            );
-
-            resetMQTTEstop();
-
-            return;
-        }
-
-        Serial.print(
-            "UNKNOWN E-STOP PAYLOAD: "
-        );
-
-        Serial.println(
-            command
-        );
     }
 }
 
 /* ======================================================
-   WIFI
+   WIFI CONNECTION
    ====================================================== */
 
 void connectWiFi()
@@ -1150,6 +978,7 @@ void connectWiFi()
     }
 
     Serial.println();
+
     Serial.println(
         "Connecting to WiFi..."
     );
@@ -1163,19 +992,24 @@ void connectWiFi()
         WIFI_PASSWORD
     );
 
-    unsigned long start =
+    unsigned long startTime =
         millis();
 
     while (
         WiFi.status() !=
             WL_CONNECTED &&
-        millis() - start <
+        millis() -
+            startTime <
             15000
     )
     {
-        delay(500);
+        delay(
+            500
+        );
 
-        Serial.print(".");
+        Serial.print(
+            "."
+        );
     }
 
     Serial.println();
@@ -1198,17 +1032,11 @@ void connectWiFi()
         );
 
         Serial.print(
-            "Broker: "
+            "Broker IP: "
         );
-
-        Serial.print(
-            MQTT_BROKER_HOST
-        );
-
-        Serial.print(":");
 
         Serial.println(
-            MQTT_BROKER_PORT
+            MQTT_BROKER_HOST
         );
     }
 
@@ -1244,14 +1072,16 @@ void connectMQTT()
     Serial.println();
 
     Serial.print(
-        "Connecting MQTT -> "
+        "Connecting to MQTT broker "
     );
 
     Serial.print(
         MQTT_BROKER_HOST
     );
 
-    Serial.print(":");
+    Serial.print(
+        ":"
+    );
 
     Serial.println(
         MQTT_BROKER_PORT
@@ -1263,25 +1093,28 @@ void connectMQTT()
             MQTT_USERNAME,
             MQTT_PASSWORD,
 
-            /*
-               Last Will
-            */
+            // Last Will topic
             TOPIC_DEVICE_STATUS,
+
+            // QoS
             0,
+
+            // Retained
             true,
+
+            // Last Will message
             "offline"
         );
 
     if (connected)
     {
-        Serial.println();
         Serial.println(
             "MQTT CONNECTED"
         );
 
-        /* ==================================================
-           DEVICE ONLINE
-           ================================================== */
+        /* ----------------------------------------------
+           ONLINE STATUS
+           ---------------------------------------------- */
 
         mqttClient.publish(
             TOPIC_DEVICE_STATUS,
@@ -1289,63 +1122,25 @@ void connectMQTT()
             true
         );
 
-        /* ==================================================
-           VIBRATION SUBSCRIPTION
-           ================================================== */
+        /* ----------------------------------------------
+           SUBSCRIBE TO NODE-RED
+           ---------------------------------------------- */
 
-        bool vibrationSubscription =
-            mqttClient.subscribe(
-                TOPIC_VIBRATION
-            );
-
-        Serial.print(
-            "SUB "
-        );
-
-        Serial.print(
-            TOPIC_VIBRATION
-        );
-
-        Serial.print(
-            " -> "
-        );
-
-        Serial.println(
-            vibrationSubscription
-                ? "OK"
-                : "FAILED"
-        );
-
-        /* ==================================================
-           DASHBOARD E-STOP SUBSCRIPTION
-           ================================================== */
-
-        bool estopSubscription =
-            mqttClient.subscribe(
-                TOPIC_ESTOP_COMMAND
-            );
-
-        Serial.print(
-            "SUB "
-        );
-
-        Serial.print(
+        mqttClient.subscribe(
             TOPIC_ESTOP_COMMAND
         );
 
         Serial.print(
-            " -> "
+            "Subscribed: "
         );
 
         Serial.println(
-            estopSubscription
-                ? "OK"
-                : "FAILED"
+            TOPIC_ESTOP_COMMAND
         );
 
-        /* ==================================================
+        /* ----------------------------------------------
            INITIAL DATA
-           ================================================== */
+           ---------------------------------------------- */
 
         publishState();
 
@@ -1365,7 +1160,7 @@ void connectMQTT()
 }
 
 /* ======================================================
-   PUBLISH TEMPERATURES
+   MQTT TEMPERATURE PUBLISH
    ====================================================== */
 
 void publishTemperatures()
@@ -1378,7 +1173,7 @@ void publishTemperatures()
     char value[16];
 
     /* ==================================================
-       X
+       TEMP X
        ================================================== */
 
     if (isfinite(tempX))
@@ -1397,7 +1192,7 @@ void publishTemperatures()
     }
 
     /* ==================================================
-       Y
+       TEMP Y
        ================================================== */
 
     if (isfinite(tempY))
@@ -1417,7 +1212,7 @@ void publishTemperatures()
 }
 
 /* ======================================================
-   PUBLISH STATE
+   MQTT STATE PUBLISH
    ====================================================== */
 
 void publishState()
@@ -1437,7 +1232,7 @@ void publishState()
 }
 
 /* ======================================================
-   OLED
+   OLED DISPLAY
    ====================================================== */
 
 void updateOLED()
@@ -1503,7 +1298,7 @@ void updateOLED()
        ================================================== */
 
     oled.setCursor(
-        64,
+        65,
         25
     );
 
@@ -1536,11 +1331,11 @@ void updateOLED()
 
     oled.setCursor(
         0,
-        40
+        41
     );
 
     oled.print(
-        "CNC:"
+        "CNC: "
     );
 
     oled.print(
@@ -1550,48 +1345,34 @@ void updateOLED()
     );
 
     /* ==================================================
-       SAFETY STATUS
+       BOTTOM STATUS
        ================================================== */
 
     oled.setCursor(
         0,
-        57
+        58
     );
 
-    if (mqttEstopActive)
-    {
-        oled.print(
-            "DASHBOARD E-STOP"
-        );
-    }
-
-    else if (vibrationTripActive)
-    {
-        oled.print(
-            "VIB >1G - STOP"
-        );
-    }
-
-    else if (thermalTripActive)
+    if (thermalTripActive)
     {
         oled.print(
             "TEMP HIGH - STOP"
         );
     }
 
+    else if (manualStopActive)
+    {
+        oled.print(
+            "MANUAL E-STOP"
+        );
+    }
+
     else
     {
         oled.print(
-            "V:"
-        );
-
-        oled.print(
-            vibrationRMS,
-            2
-        );
-
-        oled.print(
-            "g "
+            relayActive
+                ? "RELAY ON "
+                : "RELAY OFF "
         );
 
         oled.print(
@@ -1621,6 +1402,43 @@ void printStatus()
        ================================================== */
 
     Serial.print(
+        "ESP32 IP: "
+    );
+
+    if (
+        WiFi.status() ==
+        WL_CONNECTED
+    )
+    {
+        Serial.println(
+            WiFi.localIP()
+        );
+    }
+
+    else
+    {
+        Serial.println(
+            "OFFLINE"
+        );
+    }
+
+    Serial.print(
+        "MQTT Broker: "
+    );
+
+    Serial.print(
+        MQTT_BROKER_HOST
+    );
+
+    Serial.print(
+        ":"
+    );
+
+    Serial.println(
+        MQTT_BROKER_PORT
+    );
+
+    Serial.print(
         "MQTT: "
     );
 
@@ -1631,7 +1449,7 @@ void printStatus()
     );
 
     /* ==================================================
-       TEMP X
+       TEMPERATURE
        ================================================== */
 
     Serial.print(
@@ -1657,10 +1475,6 @@ void printStatus()
         );
     }
 
-    /* ==================================================
-       TEMP Y
-       ================================================== */
-
     Serial.print(
         "Temp Y: "
     );
@@ -1685,66 +1499,11 @@ void printStatus()
     }
 
     /* ==================================================
-       VIBRATION
+       RDC INPUTS
        ================================================== */
 
     Serial.print(
-        "Vibration: "
-    );
-
-    Serial.print(
-        vibrationRMS,
-        3
-    );
-
-    Serial.println(
-        " g"
-    );
-
-    Serial.print(
-        "Vibration Trip: "
-    );
-
-    Serial.println(
-        vibrationTripActive
-            ? "ACTIVE"
-            : "NORMAL"
-    );
-
-    /* ==================================================
-       MQTT E-STOP
-       ================================================== */
-
-    Serial.print(
-        "Dashboard E-Stop: "
-    );
-
-    Serial.println(
-        mqttEstopActive
-            ? "ACTIVE"
-            : "OFF"
-    );
-
-    /* ==================================================
-       TEMPERATURE TRIP
-       ================================================== */
-
-    Serial.print(
-        "Temperature Trip: "
-    );
-
-    Serial.println(
-        thermalTripActive
-            ? "ACTIVE"
-            : "NORMAL"
-    );
-
-    /* ==================================================
-       RDC
-       ================================================== */
-
-    Serial.print(
-        "RDC OUT1: "
+        "RDC OUT1 GPIO19: "
     );
 
     Serial.println(
@@ -1754,7 +1513,7 @@ void printStatus()
     );
 
     Serial.print(
-        "RDC OUT2: "
+        "RDC OUT2 GPIO18: "
     );
 
     Serial.println(
@@ -1764,7 +1523,7 @@ void printStatus()
     );
 
     /* ==================================================
-       CNC
+       CNC STATE
        ================================================== */
 
     Serial.print(
@@ -1778,22 +1537,81 @@ void printStatus()
     );
 
     /* ==================================================
-       RELAY
+       SAFETY
        ================================================== */
 
     Serial.print(
-        "Relay GPIO27: "
+        "Thermal Trip: "
+    );
+
+    Serial.println(
+        thermalTripActive
+            ? "ACTIVE"
+            : "NORMAL"
+    );
+
+    Serial.print(
+        "Manual E-Stop: "
+    );
+
+    Serial.println(
+        manualStopActive
+            ? "ACTIVE"
+            : "OFF"
+    );
+
+    Serial.print(
+        "Relay: "
     );
 
     Serial.println(
         relayActive
-            ? "ENERGIZED / HIGH"
-            : "OFF / LOW"
+            ? "ENERGIZED"
+            : "OFF"
     );
 
     Serial.println(
         "--------------------------------"
     );
+}
+
+/* ======================================================
+   SERIAL COMMANDS
+   ====================================================== */
+
+void handleSerialCommands()
+{
+    if (!Serial.available())
+    {
+        return;
+    }
+
+    char command =
+        Serial.read();
+
+    /*
+       O = Manual E-stop / Relay ON
+    */
+
+    if (
+        command == 'O' ||
+        command == 'o'
+    )
+    {
+        triggerManualStop();
+    }
+
+    /*
+       F = Reset / Relay OFF
+    */
+
+    else if (
+        command == 'F' ||
+        command == 'f'
+    )
+    {
+        resetManualStop();
+    }
 }
 
 /* ======================================================
@@ -1851,12 +1669,9 @@ void setup()
         false
     );
 
-    Serial.println(
-        "Relay GPIO27 initialized OFF"
-    );
-
     /* ==================================================
-       BME X
+       BME280 X
+       SDA21 / SCL23
        ================================================== */
 
     BME_X_BUS.begin(
@@ -1882,7 +1697,8 @@ void setup()
     );
 
     /* ==================================================
-       BME Y
+       BME280 Y
+       SDA32 / SCL33
        ================================================== */
 
     BME_Y_BUS.begin(
@@ -1909,6 +1725,7 @@ void setup()
 
     /* ==================================================
        OLED
+       SDA4 / SCL16
        ================================================== */
 
     oled.setI2CAddress(
@@ -1947,7 +1764,7 @@ void setup()
     oled.sendBuffer();
 
     /* ==================================================
-       INITIAL VALUES
+       INITIAL SENSOR READ
        ================================================== */
 
     readTemperatures();
@@ -1984,11 +1801,11 @@ void setup()
 
     connectMQTT();
 
-    updateOLED();
-
     /* ==================================================
-       READY
+       OLED INITIAL UPDATE
        ================================================== */
+
+    updateOLED();
 
     Serial.println();
 
@@ -2006,54 +1823,66 @@ void setup()
 
     Serial.println();
 
-    Serial.print(
-        "Broker: "
-    );
-
-    Serial.print(
-        MQTT_BROKER_HOST
-    );
-
-    Serial.print(":");
-
     Serial.println(
-        MQTT_BROKER_PORT
-    );
-
-    Serial.println();
-
-    Serial.print(
-        "SUB vibration: "
+        "Connections:"
     );
 
     Serial.println(
-        TOPIC_VIBRATION
-    );
-
-    Serial.print(
-        "SUB dashboard E-stop: "
+        "BME X -> SDA21 SCL23"
     );
 
     Serial.println(
-        TOPIC_ESTOP_COMMAND
+        "BME Y -> SDA32 SCL33"
+    );
+
+    Serial.println(
+        "OLED  -> SDA4 SCL16"
+    );
+
+    Serial.println(
+        "OUT1  -> GPIO19"
+    );
+
+    Serial.println(
+        "OUT2  -> GPIO18"
+    );
+
+    Serial.println(
+        "Relay -> GPIO27"
     );
 
     Serial.println();
 
     Serial.println(
-        "RELAY ENERGIZES WHEN:"
+        "ESP32 expected IP: 192.168.1.108"
     );
 
     Serial.println(
-        "- Temp >= 50 C"
+        "MQTT Broker IP: 192.168.1.18"
+    );
+
+    Serial.println();
+
+    Serial.println(
+        "Temperature trip: 50 C"
     );
 
     Serial.println(
-        "- Vibration > 1.00 g"
+        "Temperature reset: 48 C"
+    );
+
+    Serial.println();
+
+    Serial.println(
+        "Serial commands:"
     );
 
     Serial.println(
-        "- Dashboard E-stop command"
+        "O = Manual E-Stop"
+    );
+
+    Serial.println(
+        "F = Reset E-Stop"
     );
 }
 
@@ -2109,7 +1938,7 @@ void loop()
     }
 
     /* ==================================================
-       MQTT
+       MQTT PROCESSING
        ================================================== */
 
     if (mqttClient.connected())
@@ -2190,6 +2019,12 @@ void loop()
 
         printStatus();
     }
+
+    /* ==================================================
+       SERIAL TEST COMMANDS
+       ================================================== */
+
+    handleSerialCommands();
 
     delay(
         20
