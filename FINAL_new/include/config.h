@@ -25,6 +25,7 @@
 #define SCL_BUS2 33
 #define OLED_SDA 4
 #define OLED_SCL 16
+#define RELAY_PIN 14
 
 #define BME_X_ADDRESS 0x76
 #define BME_Y_ADDRESS 0x76

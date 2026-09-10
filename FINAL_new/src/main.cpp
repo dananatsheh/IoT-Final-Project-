@@ -1,636 +1,253 @@
 #include <Arduino.h>
-#include <WiFi.h>
-#include <PubSubClient.h>
-#include <Wire.h>
-#include <Adafruit_Sensor.h>
-#include <Adafruit_BME280.h>
-#include <Adafruit_MPU6050.h>
-#include <U8g2lib.h>
-#include <time.h>
-#include "config.h"
 
-TwoWire &I2C_BUS1 = Wire;
-TwoWire &I2C_BUS2 = Wire1;
+/* =========================
+   RDC6445S INPUT PINS
+   ========================= */
 
-Adafruit_BME280 bmeX;
-Adafruit_BME280 bmeY;
-Adafruit_MPU6050 mpu;
+#define RDC_OUT1_PIN 19   // ES32C14 IN1
+#define RDC_OUT2_PIN 18   // ES32C14 IN2
 
-U8G2_SSD1306_128X64_NONAME_F_SW_I2C oled(U8G2_R0, OLED_SCL, OLED_SDA, U8X8_PIN_NONE);
+/* =========================
+   CNC STATES
+   ========================= */
 
-WiFiClient wifiClient;
-PubSubClient mqtt(wifiClient);
-
-enum JobState {
-    STATE_IDLE,
-    STATE_RUNNING,
-    STATE_FAULTED,
-    STATE_DONE,
-    STATE_UNKNOWN
+enum CNCState
+{
+    CNC_IDLE,
+    CNC_RUNNING,
+    CNC_DONE,
+    CNC_FAULT
 };
 
-JobState currentState = STATE_UNKNOWN;
+CNCState currentState = CNC_IDLE;
+CNCState previousState = CNC_IDLE;
 
-bool bmeXOK = false;
-bool bmeYOK = false;
-bool mpuOK = false;
-bool oledOK = false;
+/*
+ * OUT1:
+ * LOW  = RDC is idle / standby
+ * HIGH = RDC is not idle
+ *
+ * OUT2:
+ * LOW  = system error / fault
+ * HIGH = no system error
+ */
 
-bool estopLatched = false;
-String estopReason = "";
+bool wasRunning = false;
 
-bool jobActive = false;
-bool jobEndSent = false;
+/*
+ * We show DONE briefly after:
+ *
+ * RUNNING -> IDLE
+ *
+ * then return to IDLE.
+ */
+unsigned long doneStartTime = 0;
+const unsigned long DONE_DISPLAY_TIME = 2000;
 
-float axSamples[VIBRATION_WINDOW_SIZE];
-float aySamples[VIBRATION_WINDOW_SIZE];
-float azSamples[VIBRATION_WINDOW_SIZE];
 
-int vibrationIndex = 0;
-int vibrationCount = 0;
+/* =========================
+   STATE NAME
+   ========================= */
 
-float tempX = NAN;
-float tempY = NAN;
-float vibrationRMS = NAN;
+const char *stateToString(CNCState state)
+{
+    switch (state)
+    {
+        case CNC_IDLE:
+            return "IDLE";
 
-unsigned long lastVibrationSample = 0;
-unsigned long lastSensorPublish = 0;
-unsigned long lastOLEDUpdate = 0;
-unsigned long lastWiFiAttempt = 0;
-unsigned long lastMQTTAttempt = 0;
+        case CNC_RUNNING:
+            return "RUNNING";
 
-bool devicePresent(TwoWire &bus, uint8_t address) {
-    bus.beginTransmission(address);
-    return bus.endTransmission() == 0;
-}
+        case CNC_DONE:
+            return "DONE";
 
-const char *stateToString(JobState state) {
-    switch (state) {
-        case STATE_IDLE: return "idle";
-        case STATE_RUNNING: return "running";
-        case STATE_FAULTED: return "faulted";
-        case STATE_DONE: return "done";
-        default: return "unknown";
+        case CNC_FAULT:
+            return "FAULTED";
+
+        default:
+            return "UNKNOWN";
     }
 }
 
-String getTimestamp() {
-    time_t now;
-    time(&now);
 
-    if (now > 1700000000) {
-        return String((unsigned long)now);
-    }
+/* =========================
+   READ RDC STATE
+   ========================= */
 
-    return "uptime_ms:" + String(millis());
-}
+void updateCNCState()
+{
+    int out1 = digitalRead(RDC_OUT1_PIN);
+    int out2 = digitalRead(RDC_OUT2_PIN);
 
-void mqttPublish(const char *topic, const String &payload, bool retained = false) {
-    if (mqtt.connected()) {
-        mqtt.publish(topic, payload.c_str(), retained);
-    }
-}
+    /*
+     * Active LOW signals
+     */
 
-void setEstopRelay(bool active) {
-    digitalWrite(ESTOP_RELAY_PIN, active ? ESTOP_RELAY_ACTIVE_LEVEL : ESTOP_RELAY_INACTIVE_LEVEL);
-}
+    bool idleSignal  = (out1 == LOW);
+    bool faultSignal = (out2 == LOW);
 
-void triggerEstop(const String &reason) {
-    if (estopLatched) {
+
+    /* -------------------------
+       Highest priority = fault
+       ------------------------- */
+
+    if (faultSignal)
+    {
+        currentState = CNC_FAULT;
+
+        /*
+         * Do not interpret a later idle state
+         * as successful completion.
+         */
+        wasRunning = false;
+
         return;
     }
 
-    estopLatched = true;
-    estopReason = reason;
 
-    setEstopRelay(true);
+    /* -------------------------
+       DONE state timer
+       ------------------------- */
 
-    Serial.print("E-STOP TRIGGERED: ");
-    Serial.println(reason);
-
-    mqttPublish(TOPIC_ESTOP_EVENT, reason);
-}
-
-void resetEstop() {
-    if (digitalRead(DI_IN4_PIN) == DI_ACTIVE_LEVEL) {
-        Serial.println("E-STOP RESET BLOCKED");
-        return;
-    }
-
-    estopLatched = false;
-    estopReason = "";
-
-    setEstopRelay(false);
-
-    Serial.println("E-STOP RESET");
-
-    mqttPublish(TOPIC_ESTOP_EVENT, "clear");
-}
-
-void mqttCallback(char *topic, byte *payload, unsigned int length) {
-    String message;
-
-    for (unsigned int i = 0; i < length; i++) {
-        message += (char)payload[i];
-    }
-
-    message.trim();
-
-    if (String(topic) == TOPIC_ESTOP_COMMAND) {
-        if (message == "manual") {
-            triggerEstop("manual");
+    if (currentState == CNC_DONE)
+    {
+        if (millis() - doneStartTime < DONE_DISPLAY_TIME)
+        {
+            return;
         }
 
-        if (message == "reset") {
-            resetEstop();
+        currentState = CNC_IDLE;
+    }
+
+
+    /* -------------------------
+       IDLE
+       ------------------------- */
+
+    if (idleSignal)
+    {
+        /*
+         * If machine was running before
+         * and now returned to idle,
+         * interpret that as DONE.
+         */
+
+        if (wasRunning)
+        {
+            currentState = CNC_DONE;
+            doneStartTime = millis();
+
+            wasRunning = false;
+        }
+        else
+        {
+            currentState = CNC_IDLE;
         }
     }
-}
 
-void connectWiFi() {
-    if (WiFi.status() == WL_CONNECTED) {
-        return;
-    }
+    /* -------------------------
+       NOT IDLE = ACTIVE
+       ------------------------- */
 
-    if (millis() - lastWiFiAttempt < WIFI_RECONNECT_INTERVAL_MS) {
-        return;
-    }
+    else
+    {
+        currentState = CNC_RUNNING;
 
-    lastWiFiAttempt = millis();
-
-    Serial.print("Connecting WiFi: ");
-    Serial.println(WIFI_SSID);
-
-    WiFi.disconnect();
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-}
-
-void connectMQTT() {
-    if (WiFi.status() != WL_CONNECTED) {
-        return;
-    }
-
-    if (mqtt.connected()) {
-        mqtt.loop();
-        return;
-    }
-
-    if (millis() - lastMQTTAttempt < MQTT_RECONNECT_INTERVAL_MS) {
-        return;
-    }
-
-    lastMQTTAttempt = millis();
-
-    bool connected = false;
-
-    if (strlen(MQTT_USERNAME) > 0) {
-        connected = mqtt.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD, TOPIC_DEVICE_STATUS, 0, true, "offline");
-    } else {
-        connected = mqtt.connect(MQTT_CLIENT_ID, TOPIC_DEVICE_STATUS, 0, true, "offline");
-    }
-
-    if (connected) {
-        Serial.println("MQTT CONNECTED");
-
-        mqtt.publish(TOPIC_DEVICE_STATUS, "online", true);
-        mqtt.subscribe(TOPIC_ESTOP_COMMAND);
-
-        mqttPublish(TOPIC_STATE, stateToString(currentState), true);
-    } else {
-        Serial.print("MQTT ERROR: ");
-        Serial.println(mqtt.state());
+        wasRunning = true;
     }
 }
 
-bool initSensors() {
-    bmeXOK = devicePresent(I2C_BUS1, BME_X_ADDRESS);
 
-    if (bmeXOK) {
-        bmeXOK = bmeX.begin(BME_X_ADDRESS, &I2C_BUS1);
-    }
+/* =========================
+   PRINT STATUS
+   ========================= */
 
-    bmeYOK = devicePresent(I2C_BUS2, BME_Y_ADDRESS);
+void printStateIfChanged()
+{
+    if (currentState != previousState)
+    {
+        Serial.println();
+        Serial.println("==========================");
 
-    if (bmeYOK) {
-        bmeYOK = bmeY.begin(BME_Y_ADDRESS, &I2C_BUS2);
-    }
+        Serial.print("CNC STATE: ");
+        Serial.println(stateToString(currentState));
 
-    mpuOK = devicePresent(I2C_BUS2, MPU_ADDRESS);
+        Serial.println("==========================");
 
-    if (mpuOK) {
-        mpuOK = mpu.begin(MPU_ADDRESS, &I2C_BUS2);
-    }
-
-    if (mpuOK) {
-        mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-        mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-        mpu.setFilterBandwidth(MPU6050_BAND_44_HZ);
-    }
-
-    Serial.print("BME280 X: ");
-    Serial.println(bmeXOK ? "OK" : "ERROR");
-
-    Serial.print("BME280 Y: ");
-    Serial.println(bmeYOK ? "OK" : "ERROR");
-
-    Serial.print("MPU6050: ");
-    Serial.println(mpuOK ? "OK" : "ERROR");
-
-    return bmeXOK && bmeYOK && mpuOK;
-}
-
-void initOLED() {
-    oled.setI2CAddress(OLED_ADDRESS << 1);
-    oled.begin();
-
-    oledOK = true;
-
-    oled.clearBuffer();
-    oled.setFont(u8g2_font_6x10_tf);
-    oled.setCursor(0, 12);
-    oled.print("SMART CNC STATION");
-    oled.setCursor(0, 28);
-    oled.print("Starting...");
-    oled.sendBuffer();
-}
-
-void sampleVibration() {
-    if (!mpuOK) {
-        return;
-    }
-
-    if (millis() - lastVibrationSample < VIBRATION_SAMPLE_INTERVAL_MS) {
-        return;
-    }
-
-    lastVibrationSample = millis();
-
-    sensors_event_t accel;
-    sensors_event_t gyro;
-    sensors_event_t temperature;
-
-    bool success = mpu.getEvent(&accel, &gyro, &temperature);
-
-    if (!success) {
-        return;
-    }
-
-    if (!isfinite(accel.acceleration.x) ||
-        !isfinite(accel.acceleration.y) ||
-        !isfinite(accel.acceleration.z)) {
-        return;
-    }
-
-    axSamples[vibrationIndex] = accel.acceleration.x;
-    aySamples[vibrationIndex] = accel.acceleration.y;
-    azSamples[vibrationIndex] = accel.acceleration.z;
-
-    vibrationIndex++;
-
-    if (vibrationIndex >= VIBRATION_WINDOW_SIZE) {
-        vibrationIndex = 0;
-    }
-
-    if (vibrationCount < VIBRATION_WINDOW_SIZE) {
-        vibrationCount++;
+        previousState = currentState;
     }
 }
 
-float calculateVibrationRMS() {
-    if (vibrationCount < VIBRATION_WINDOW_SIZE) {
-        return NAN;
-    }
 
-    float sumX = 0.0;
-    float sumY = 0.0;
-    float sumZ = 0.0;
+/* =========================
+   RAW DEBUG VALUES
+   ========================= */
 
-    for (int i = 0; i < vibrationCount; i++) {
-        sumX += axSamples[i];
-        sumY += aySamples[i];
-        sumZ += azSamples[i];
-    }
+void printRawSignals()
+{
+    static unsigned long previousPrint = 0;
 
-    float meanX = sumX / vibrationCount;
-    float meanY = sumY / vibrationCount;
-    float meanZ = sumZ / vibrationCount;
+    if (millis() - previousPrint >= 1000)
+    {
+        previousPrint = millis();
 
-    float sumSquares = 0.0;
+        int out1 = digitalRead(RDC_OUT1_PIN);
+        int out2 = digitalRead(RDC_OUT2_PIN);
 
-    for (int i = 0; i < vibrationCount; i++) {
-        float dx = axSamples[i] - meanX;
-        float dy = aySamples[i] - meanY;
-        float dz = azSamples[i] - meanZ;
+        Serial.print("OUT1: ");
+        Serial.print(out1);
 
-        sumSquares += dx * dx + dy * dy + dz * dz;
-    }
-
-    float vibrationMS2 = sqrt(sumSquares / vibrationCount);
-
-    return vibrationMS2 / 9.80665f;
-}
-
-JobState deriveJobState() {
-    if (estopLatched) {
-        return STATE_FAULTED;
-    }
-
-    bool idleSignal = digitalRead(DI_IN1_PIN) == DI_ACTIVE_LEVEL;
-    bool runningSignal = digitalRead(DI_IN2_PIN) == DI_ACTIVE_LEVEL;
-    bool faultSignal = digitalRead(DI_IN3_PIN) == DI_ACTIVE_LEVEL;
-
-    if (faultSignal) {
-        return STATE_FAULTED;
-    }
-
-    if (runningSignal) {
-        return STATE_RUNNING;
-    }
-
-    if (idleSignal) {
-        if (currentState == STATE_RUNNING || currentState == STATE_DONE) {
-            return STATE_DONE;
-        }
-
-        return STATE_IDLE;
-    }
-
-    return STATE_UNKNOWN;
-}
-
-void publishJobStart() {
-    jobActive = true;
-    jobEndSent = false;
-
-    mqttPublish(TOPIC_JOB_START, getTimestamp());
-}
-
-void publishJobEnd(const String &outcome, const String &reason) {
-    if (!jobActive || jobEndSent) {
-        return;
-    }
-
-    jobActive = false;
-    jobEndSent = true;
-
-    String payload = "{\"outcome\":\"" + outcome +
-                     "\",\"stop_reason\":\"" + reason +
-                     "\",\"timestamp\":\"" + getTimestamp() + "\"}";
-
-    mqttPublish(TOPIC_JOB_END, payload);
-}
-
-void processJobState(JobState newState) {
-    if (newState == currentState) {
-        return;
-    }
-
-    JobState previousState = currentState;
-    currentState = newState;
-
-    mqttPublish(TOPIC_STATE, stateToString(currentState), true);
-
-    Serial.print("JOB STATE: ");
-    Serial.println(stateToString(currentState));
-
-    if (currentState == STATE_RUNNING && previousState != STATE_RUNNING) {
-        publishJobStart();
-    }
-
-    if (currentState == STATE_DONE && jobActive) {
-        publishJobEnd("completed", "none");
-    }
-
-    if (currentState == STATE_FAULTED && jobActive) {
-        String reason = estopLatched ? estopReason : "machine_fault";
-        publishJobEnd("stopped", reason);
+        Serial.print("   OUT2: ");
+        Serial.println(out2);
     }
 }
 
-void checkSafety() {
-    if (estopLatched) {
-        return;
-    }
 
-    if (digitalRead(DI_IN4_PIN) == DI_ACTIVE_LEVEL) {
-        triggerEstop("manual");
-        return;
-    }
+/* =========================
+   SETUP
+   ========================= */
 
-    if (currentState == STATE_RUNNING &&
-        isfinite(vibrationRMS) &&
-        vibrationRMS > VIBRATION_THRESHOLD_G) {
-        triggerEstop("vibration");
-    }
-}
-
-void readTemperatures() {
-    tempX = bmeXOK ? bmeX.readTemperature() : NAN;
-    tempY = bmeYOK ? bmeY.readTemperature() : NAN;
-
-    if (!isfinite(tempX) || tempX < -40.0 || tempX > 85.0) {
-        tempX = NAN;
-    }
-
-    if (!isfinite(tempY) || tempY < -40.0 || tempY > 85.0) {
-        tempY = NAN;
-    }
-}
-
-void publishSensors() {
-    if (isfinite(tempX)) {
-        mqttPublish(TOPIC_TEMP_X, String(tempX, 2));
-    }
-
-    if (isfinite(tempY)) {
-        mqttPublish(TOPIC_TEMP_Y, String(tempY, 2));
-    }
-
-    if (isfinite(vibrationRMS)) {
-        mqttPublish(TOPIC_VIBRATION, String(vibrationRMS, 5));
-    }
-}
-
-void updateOLED() {
-    if (!oledOK) {
-        return;
-    }
-
-    oled.clearBuffer();
-    oled.setFont(u8g2_font_6x10_tf);
-
-    oled.setCursor(0, 9);
-    oled.print("SMART CNC STATION");
-
-    oled.setCursor(0, 19);
-    oled.print("State: ");
-    oled.print(stateToString(currentState));
-
-    oled.setCursor(0, 29);
-    oled.print("X:");
-
-    if (isfinite(tempX)) {
-        oled.print(tempX, 1);
-    } else {
-        oled.print("ERR");
-    }
-
-    oled.print(" Y:");
-
-    if (isfinite(tempY)) {
-        oled.print(tempY, 1);
-    } else {
-        oled.print("ERR");
-    }
-
-    oled.print(" C");
-
-    oled.setCursor(0, 39);
-    oled.print("Vib: ");
-
-    if (isfinite(vibrationRMS)) {
-        oled.print(vibrationRMS, 4);
-    } else {
-        oled.print("----");
-    }
-
-    oled.print(" g");
-
-    oled.setCursor(0, 49);
-    oled.print("Limit: ");
-    oled.print(VIBRATION_THRESHOLD_G, 4);
-
-    oled.setCursor(0, 59);
-    oled.print("EStop: ");
-
-    if (estopLatched) {
-        oled.print(estopReason);
-    } else {
-        oled.print("clear");
-    }
-
-    oled.sendBuffer();
-}
-
-void printStatus() {
-    Serial.println();
-    Serial.println("------------------------");
-
-    Serial.print("State: ");
-    Serial.println(stateToString(currentState));
-
-    Serial.print("Temperature X: ");
-
-    if (isfinite(tempX)) {
-        Serial.print(tempX, 2);
-        Serial.println(" C");
-    } else {
-        Serial.println("ERROR");
-    }
-
-    Serial.print("Temperature Y: ");
-
-    if (isfinite(tempY)) {
-        Serial.print(tempY, 2);
-        Serial.println(" C");
-    } else {
-        Serial.println("ERROR");
-    }
-
-    Serial.print("Vibration RMS: ");
-
-    if (isfinite(vibrationRMS)) {
-        Serial.print(vibrationRMS, 5);
-        Serial.println(" g");
-    } else {
-        Serial.println("WAITING");
-    }
-
-    Serial.print("Threshold: ");
-    Serial.print(VIBRATION_THRESHOLD_G, 5);
-    Serial.println(" g");
-
-    Serial.print("E-Stop: ");
-    Serial.println(estopLatched ? estopReason : "clear");
-
-    Serial.print("WiFi: ");
-    Serial.println(WiFi.status() == WL_CONNECTED ? "connected" : "offline");
-
-    Serial.print("MQTT: ");
-    Serial.println(mqtt.connected() ? "connected" : "offline");
-
-    Serial.println("------------------------");
-}
-
-void setup() {
+void setup()
+{
     Serial.begin(115200);
-    delay(500);
+
+    pinMode(RDC_OUT1_PIN, INPUT);
+    pinMode(RDC_OUT2_PIN, INPUT);
+
+    delay(1000);
 
     Serial.println();
-    Serial.println("==============================");
-    Serial.println("SMART CNC STATION");
-    Serial.println("==============================");
-
-    I2C_BUS1.begin(SDA_BUS1, SCL_BUS1, I2C_CLOCK_HZ);
-    I2C_BUS2.begin(SDA_BUS2, SCL_BUS2, I2C_CLOCK_HZ);
-
-    pinMode(DI_IN1_PIN, INPUT);
-    pinMode(DI_IN2_PIN, INPUT);
-    pinMode(DI_IN3_PIN, INPUT);
-    pinMode(DI_IN4_PIN, INPUT);
-
-    pinMode(ESTOP_RELAY_PIN, OUTPUT);
-    setEstopRelay(false);
-
-    initSensors();
-    initOLED();
-
-    WiFi.mode(WIFI_STA);
-
-    mqtt.setServer(MQTT_BROKER_HOST, MQTT_BROKER_PORT);
-    mqtt.setCallback(mqttCallback);
-
-    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-
-    currentState = deriveJobState();
+    Serial.println("================================");
+    Serial.println("   RDC6445S CNC STATE MONITOR");
+    Serial.println("================================");
 
     Serial.println();
-    Serial.print("Vibration threshold: ");
-    Serial.print(VIBRATION_THRESHOLD_G, 5);
-    Serial.println(" g");
+    Serial.println("Connections:");
+    Serial.println("OUT1 -> ES32C14 IN1 -> GPIO19");
+    Serial.println("OUT2 -> ES32C14 IN2 -> GPIO18");
+    Serial.println("RDC GND -> ES32C14 Input GND");
 
-    Serial.println("SYSTEM READY");
+    Serial.println();
+    Serial.println("Waiting for CNC state...");
 }
 
-void loop() {
-    connectWiFi();
-    connectMQTT();
 
-    sampleVibration();
-    vibrationRMS = calculateVibrationRMS();
+/* =========================
+   LOOP
+   ========================= */
 
-    JobState newState = deriveJobState();
-    processJobState(newState);
+void loop()
+{
+    updateCNCState();
 
-    checkSafety();
+    printStateIfChanged();
 
-    if (estopLatched && currentState != STATE_FAULTED) {
-        processJobState(STATE_FAULTED);
-    }
+    /*
+     * Keep this during testing.
+     * Later we can remove it.
+     */
+    printRawSignals();
 
-    if (millis() - lastSensorPublish >= SENSOR_PUBLISH_INTERVAL_MS) {
-        lastSensorPublish = millis();
-
-        readTemperatures();
-        publishSensors();
-        mqttPublish(TOPIC_STATE, stateToString(currentState), true);
-        printStatus();
-    }
-
-    if (millis() - lastOLEDUpdate >= OLED_UPDATE_INTERVAL_MS) {
-        lastOLEDUpdate = millis();
-        updateOLED();
-    }
-
-    delay(1);
-}
+    delay(20);
+} 
